@@ -1,0 +1,559 @@
+import sys
+import os
+import json
+import csv
+from datetime import datetime
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from torchvision import transforms
+
+from PIL import Image
+
+import pandas as pd
+
+from PyQt5.QtWidgets import (
+    QApplication,
+    QWidget,
+    QLabel,
+    QPushButton,
+    QFileDialog,
+    QVBoxLayout,
+    QTextEdit,
+    QSizePolicy
+)
+
+from PyQt5.QtGui import QPixmap
+
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+MODEL_DIR = "saved_models"
+RESULTS_DIR = "results"
+
+MODEL_PATH = os.path.join(MODEL_DIR, "rfnet_v3_best.pth")
+
+CSV_FILE = os.path.join(RESULTS_DIR, "predictions.csv")
+
+CLASS_NAMES_FILE = os.path.join(
+    RESULTS_DIR,
+    "class_names.json"
+)
+
+IMG_SIZE = 224
+
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+
+# =========================================================
+# RFNET V3
+# =========================================================
+
+class CNNBackbone(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(1, 32, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)
+
+        self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+
+        self.conv3 = nn.Conv2d(64, 128, 3, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+
+        self.conv4 = nn.Conv2d(128, 256, 3, padding=1)
+        self.bn4 = nn.BatchNorm2d(256)
+
+        self.pool = nn.MaxPool2d(2)
+
+    def forward(self, x):
+
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.pool(x)
+
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.pool(x)
+
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.pool(x)
+
+        x = F.relu(self.bn4(self.conv4(x)))
+
+        return x
+
+
+class PatchEmbedding(nn.Module):
+
+    def __init__(self, in_ch=256, dim=128):
+        super().__init__()
+
+        self.proj = nn.Conv2d(
+            in_ch,
+            dim,
+            kernel_size=1
+        )
+
+    def forward(self, x):
+
+        x = self.proj(x)
+
+        B, C, H, W = x.shape
+
+        x = x.flatten(2).transpose(1, 2)
+
+        return x
+
+
+class TransformerBlock(nn.Module):
+
+    def __init__(self, dim=128, heads=4):
+        super().__init__()
+
+        self.attn = nn.MultiheadAttention(
+            dim,
+            heads,
+            batch_first=True
+        )
+
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.ReLU(),
+            nn.Linear(dim * 2, dim)
+        )
+
+    def forward(self, x):
+
+        attn_out, _ = self.attn(x, x, x)
+
+        x = self.norm1(x + attn_out)
+
+        mlp_out = self.mlp(x)
+
+        x = self.norm2(x + mlp_out)
+
+        return x
+
+
+class RFNetV3(nn.Module):
+
+    def __init__(self, num_classes):
+        super().__init__()
+
+        self.cnn = CNNBackbone()
+
+        self.patch = PatchEmbedding(256, 128)
+
+        self.transformer = nn.Sequential(
+            TransformerBlock(128, 4),
+            TransformerBlock(128, 4)
+        )
+
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(128),
+            nn.Dropout(0.5),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x):
+
+        x = self.cnn(x)
+
+        x = self.patch(x)
+
+        x = self.transformer(x)
+
+        x = x.mean(dim=1)
+
+        x = self.classifier(x)
+
+        return x
+
+
+# =========================================================
+# LOAD CLASS NAMES
+# =========================================================
+
+with open(CLASS_NAMES_FILE, "r") as f:
+    class_names = json.load(f)
+
+NUM_CLASSES = len(class_names)
+
+
+# =========================================================
+# LOAD MODEL
+# =========================================================
+
+model = RFNetV3(NUM_CLASSES).to(DEVICE)
+
+state_dict = torch.load(
+    MODEL_PATH,
+    map_location=DEVICE
+)
+
+model.load_state_dict(state_dict)
+
+model.eval()
+
+print("✅ RFNet V3 Loaded Successfully")
+
+
+# =========================================================
+# IMAGE TRANSFORM
+# =========================================================
+
+transform = transforms.Compose([
+
+    transforms.Grayscale(num_output_channels=1),
+
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+
+    transforms.ToTensor(),
+
+    transforms.Normalize([0.5], [0.5])
+
+])
+
+
+# =========================================================
+# GUI
+# =========================================================
+
+class DronePredictorGUI(QWidget):
+
+    def __init__(self):
+
+        super().__init__()
+
+        self.setWindowTitle("RFNet V3 Drone Predictor")
+
+        self.setGeometry(100, 100, 1000, 800)
+
+        # =================================================
+        # IMAGE LABEL
+        # =================================================
+
+        self.label_img = QLabel(
+            "No Image Selected"
+        )
+
+        self.label_img.setFixedSize(450, 320)
+
+        self.label_img.setStyleSheet(
+            "border: 2px solid black;"
+        )
+
+        # =================================================
+        # RESULT TEXT
+        # =================================================
+
+        self.text_result = QTextEdit()
+
+        self.text_result.setReadOnly(True)
+
+        self.text_result.setFixedHeight(180)
+
+        # =================================================
+        # BUTTON
+        # =================================================
+
+        self.btn_open = QPushButton(
+            "Open RF Signal Image"
+        )
+
+        self.btn_open.clicked.connect(
+            self.open_image
+        )
+
+        # =================================================
+        # MATPLOTLIB
+        # =================================================
+
+        self.figure = Figure(figsize=(8, 5))
+
+        self.canvas = FigureCanvas(self.figure)
+
+        self.canvas.setSizePolicy(
+            QSizePolicy.Expanding,
+            QSizePolicy.Expanding
+        )
+
+        # =================================================
+        # LAYOUT
+        # =================================================
+
+        layout = QVBoxLayout()
+
+        layout.addWidget(self.label_img)
+
+        layout.addWidget(self.text_result)
+
+        layout.addWidget(self.canvas)
+
+        layout.addWidget(self.btn_open)
+
+        self.setLayout(layout)
+
+        # =================================================
+        # CREATE CSV
+        # =================================================
+
+        if not os.path.exists(CSV_FILE):
+
+            with open(
+                CSV_FILE,
+                "w",
+                newline="",
+                encoding="utf-8"
+            ) as f:
+
+                writer = csv.writer(f)
+
+                writer.writerow([
+                    "time",
+                    "image",
+                    "prediction",
+                    "top5_probs"
+                ])
+
+    # =====================================================
+    # OPEN IMAGE
+    # =====================================================
+
+    def open_image(self):
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select RF Image",
+            "",
+            "Images (*.png *.jpg *.jpeg)"
+        )
+
+        if not file_path:
+            return
+
+        # =================================================
+        # SHOW IMAGE
+        # =================================================
+
+        pixmap = QPixmap(file_path)
+
+        pixmap = pixmap.scaled(
+            self.label_img.width(),
+            self.label_img.height()
+        )
+
+        self.label_img.setPixmap(pixmap)
+
+        # =================================================
+        # PREDICTION
+        # =================================================
+
+        top_pred, top5 = self.predict_image(
+            file_path
+        )
+
+        # =================================================
+        # SHOW TEXT
+        # =================================================
+
+        result_text = ""
+
+        result_text += f"Prediction: {top_pred}\n\n"
+
+        result_text += "Top 5 Predictions:\n\n"
+
+        for cls, prob in top5:
+
+            result_text += (
+                f"{cls} : {prob:.2f}%\n"
+            )
+
+        self.text_result.setText(result_text)
+
+        # =================================================
+        # SAVE CSV
+        # =================================================
+
+        timestamp = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        with open(
+            CSV_FILE,
+            "a",
+            newline="",
+            encoding="utf-8"
+        ) as f:
+
+            writer = csv.writer(f)
+
+            writer.writerow([
+                timestamp,
+                file_path,
+                top_pred,
+                json.dumps(top5)
+            ])
+
+        # =================================================
+        # UPDATE PLOTS
+        # =================================================
+
+        self.update_plots()
+
+    # =====================================================
+    # PREDICT IMAGE
+    # =====================================================
+
+    def predict_image(self, img_path):
+
+        img = Image.open(img_path).convert("L")
+
+        img_tensor = transform(img)
+
+        img_tensor = img_tensor.unsqueeze(0)
+
+        img_tensor = img_tensor.to(DEVICE)
+
+        print("Input shape:", img_tensor.shape)
+
+        with torch.no_grad():
+
+            output = model(img_tensor)
+
+            probs = torch.softmax(output, dim=1)
+
+            top5_prob, top5_idx = probs.topk(5)
+
+            top5 = []
+
+            for idx, prob in zip(
+                top5_idx[0],
+                top5_prob[0]
+            ):
+
+                top5.append((
+                    class_names[idx],
+                    prob.item() * 100
+                ))
+
+        return top5[0][0], top5
+
+    # =====================================================
+    # UPDATE PLOTS
+    # =====================================================
+
+    def update_plots(self):
+
+        if not os.path.exists(CSV_FILE):
+            return
+
+        df = pd.read_csv(CSV_FILE)
+
+        if len(df) == 0:
+            return
+
+        # =================================================
+        # FIX DATETIME
+        # =================================================
+
+        df['time'] = pd.to_datetime(
+            df['time'],
+            format='mixed',
+            errors='coerce'
+        )
+
+        df = df.dropna(subset=['time'])
+
+        drones = df['prediction'].unique()
+
+        self.figure.clear()
+
+        # =================================================
+        # TIMELINE
+        # =================================================
+
+        ax1 = self.figure.add_subplot(2, 1, 1)
+
+        for drone in drones:
+
+            times = df[
+                df['prediction'] == drone
+            ]['time']
+
+            ax1.scatter(
+                times,
+                [drone] * len(times),
+                alpha=0.7
+            )
+
+        ax1.set_title(
+            "Drone Appearance Timeline"
+        )
+
+        ax1.set_xlabel("Time")
+
+        ax1.set_ylabel("Drone Type")
+
+        ax1.tick_params(
+            axis='x',
+            rotation=45
+        )
+
+        # =================================================
+        # COUNTS
+        # =================================================
+
+        ax2 = self.figure.add_subplot(2, 1, 2)
+
+        counts = df['prediction'].value_counts()
+
+        ax2.bar(
+            counts.index,
+            counts.values
+        )
+
+        ax2.set_title(
+            "Prediction Counts"
+        )
+
+        ax2.set_xlabel("Drone Type")
+
+        ax2.set_ylabel("Count")
+
+        ax2.tick_params(
+            axis='x',
+            rotation=45
+        )
+
+        self.figure.tight_layout()
+
+        self.canvas.draw()
+
+
+# =========================================================
+# RUN
+# =========================================================
+
+if __name__ == "__main__":
+
+    app = QApplication(sys.argv)
+
+    window = DronePredictorGUI()
+
+    window.show()
+
+    sys.exit(app.exec_())
